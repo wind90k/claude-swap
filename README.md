@@ -377,6 +377,29 @@ setup-token. It switches like any other account; since API keys have no subscrip
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
 
+## Relay keys via settings.json (fork addition)
+
+For third-party Anthropic-compatible relays (new-api/one-api style) there is no
+login: Claude Code is pointed at the relay through the `env` block of a settings
+file. `cswap relay` stores several relay keys, shows their live balances (the
+relay's `/api/usage/token/` endpoint, the same one its `/balance` page uses) and
+switches between them:
+
+```bash
+cswap relay add blue-az-0 sk-... --base-url https://relay.example.com/v1 --model claude-opus-5-5
+cswap relay add blue-az-1 sk-...          # reuses the previous base URL and model
+echo sk-... | cswap relay add blue-az-2 - # read the key from stdin
+cswap relay list                          # balance of every key (* = active)
+cswap relay use auto                      # put the key with the most quota left into ~/.claude/settings.json
+cswap relay use blue-az-1
+cswap relay use --off                     # remove the relay env again
+cswap relay run auto -- --resume          # this terminal only: claude --settings <profile file>
+```
+
+`use` only rewrites `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and
+`ANTHROPIC_MODEL` in `settings.json`; every other key is preserved. Profiles
+live in `relay/profiles.json` in the backup root (0600).
+
 ## Uninstall
 
 Remove all data:
