@@ -396,9 +396,33 @@ cswap relay use --off                     # remove the relay env again
 cswap relay run auto -- --resume          # this terminal only: claude --settings <profile file>
 ```
 
-`use` only rewrites `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and
-`ANTHROPIC_MODEL` in `settings.json`; every other key is preserved. Profiles
-live in `relay/profiles.json` in the backup root (0600).
+The relay table shows the profile, masked key, model, gateway, and reported
+balance. `No balance API` means the balance endpoint returned 404. `use auto`
+picks from profiles with usable reported balances. `list --json` also shows any
+saved context overrides.
+
+Profiles live in `relay/profiles.json` in the backup root (0600). To tune how
+Claude Code uses a model's context, pass optional settings when adding the profile:
+
+```bash
+cswap relay add long-context sk-... --base-url https://relay.example.com --model custom-model \
+  --context-window 1M --auto-compact 850k --max-output-tokens 128000
+```
+
+- `--context-window` sets the context window Claude Code assumes. Use a size the
+  relay supports for the selected model.
+- `--auto-compact` sets the automatic compaction window from `100k` to `1M`.
+  Use `off` to disable automatic compaction while keeping `/compact` available.
+- `--max-output-tokens` sets the output token limit for most requests. Claude
+  Code and the relay can enforce lower limits.
+
+Both `use` and `run` apply the saved settings. New profiles only override the
+options supplied at `add`. With `add --force`, omitted context options retain
+their values, and `auto` clears an override. `use` writes the selected relay's
+authentication, model, and configured context overrides into `settings.json`.
+Switching profiles or running `use --off` restores the previous context values
+for overrides that no longer apply. These settings apply for the session started
+with the profile, including after an in-session model switch.
 
 ## Uninstall
 

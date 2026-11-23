@@ -1,13 +1,11 @@
 """Relay profiles: third-party Anthropic-compatible endpoints driven by settings.json.
 
-A relay profile is a (base URL, key, model) triple for a new-api/one-api style
-relay. Instead of logging in, cswap hands the triple to Claude Code through a
-settings file's ``env`` block (``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN``
-/ ``ANTHROPIC_MODEL``):
+A relay profile stores a base URL, key, model, and optional context settings.
+cswap passes these to Claude Code through a settings file's ``env`` block.
 
 - ``cswap relay use NAME|auto`` merges that block into ``~/.claude/settings.json``
-  so every new Claude Code instance (terminal and IDE) uses the relay;
-  ``--off`` removes it again, leaving every other key untouched.
+  so every new Claude Code instance (terminal and IDE) uses the relay.
+  ``--off`` removes it and restores any context values the relay replaced.
 - ``cswap relay run NAME|auto`` writes a per-profile settings file under the
   backup root and execs ``claude --settings <file>``: this terminal only.
 
@@ -26,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,22 +35,43 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
+from urllib.parse import urlsplit
+
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 from claude_swap import paths
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.printer import accent, bolded, dimmed, error, muted, warning
+from claude_swap.printer import accent, bolded, colors_enabled, dimmed, error, muted, warning
 from claude_swap.settings import atomic_write_json
 
 QUOTA_PER_USD = 500_000
 USAGE_PATH = "/api/usage/token/"
 ENV_KEYS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL")
+CONTEXT_WINDOW_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+DISABLE_AUTO_COMPACT_ENV = "DISABLE_AUTO_COMPACT"
+MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+CONTEXT_ENV_KEYS = (
+    CONTEXT_WINDOW_ENV,
+    AUTO_COMPACT_WINDOW_ENV,
+    DISABLE_AUTO_COMPACT_ENV,
+    MAX_OUTPUT_TOKENS_ENV,
+)
+# Keep ownership information in the same atomic settings write as the overrides.
+CONTEXT_STATE_ENV = "CSWAP_RELAY_CONTEXT_OVERRIDES"
 SCHEMA_VERSION = 1
 
 
 class RelayError(ClaudeSwitchError):
     """A relay profile operation failed."""
+
+
+class BalanceEndpointNotFound(RelayError):
+    """The relay's balance endpoint returned HTTP 404."""
 
 
 @dataclass(frozen=True)
@@ -60,11 +80,26 @@ class Profile:
     base_url: str
     key: str
     model: str | None = None
+    context_window: int | None = None
+    auto_compact: int | Literal["off"] | None = None
+    max_output_tokens: int | None = None
+
+    def context_options(self) -> dict[str, int | str]:
+        return {
+            name: value
+            for name, value in (
+                ("contextWindow", self.context_window),
+                ("autoCompact", self.auto_compact),
+                ("maxOutputTokens", self.max_output_tokens),
+            )
+            if value is not None
+        }
 
     def to_json(self) -> dict:
         data = {"name": self.name, "baseUrl": self.base_url, "key": self.key}
         if self.model:
             data["model"] = self.model
+        data.update(self.context_options())
         return data
 
     @classmethod
@@ -74,6 +109,9 @@ class Profile:
             base_url=data["baseUrl"],
             key=data["key"],
             model=data.get("model") or None,
+            context_window=data.get("contextWindow"),
+            auto_compact=data.get("autoCompact"),
+            max_output_tokens=data.get("maxOutputTokens"),
         )
 
 
@@ -144,6 +182,12 @@ def find_profile(profiles: list[Profile], name: str) -> Profile:
     raise RelayError(f"No relay profile named {name!r} (known: {known})")
 
 
+def _updated_override[T](value: T | Literal["auto"] | None, previous: T | None) -> T | None:
+    if value == "auto":
+        return None
+    return previous if value is None else value
+
+
 def add_profile(
     root: Path | None,
     name: str,
@@ -152,11 +196,15 @@ def add_profile(
     model: str | None,
     *,
     force: bool = False,
+    context_window: int | Literal["auto"] | None = None,
+    auto_compact: int | Literal["auto", "off"] | None = None,
+    max_output_tokens: int | Literal["auto"] | None = None,
 ) -> Profile:
     """Add (or with ``force`` replace) a profile.
 
     ``base_url`` and ``model`` default to the most recently added profile's,
     so a batch of keys for one relay only needs them spelled out once.
+    Context overrides belong to this profile and can be cleared with ``auto``.
     """
     profiles = load_profiles(root)
     key = key.strip()
@@ -169,13 +217,23 @@ def add_profile(
         base_url = last.base_url
     if model is None and last is not None:
         model = last.model
-    profile = Profile(name=name, base_url=normalize_base_url(base_url), key=key, model=model)
-
-    existing = [i for i, p in enumerate(profiles) if p.name == name]
-    if existing and not force:
+    index = next((i for i, p in enumerate(profiles) if p.name == name), None)
+    if index is not None and not force:
         raise RelayError(f"Relay profile {name!r} already exists (use --force to replace)")
-    if existing:
-        profiles[existing[0]] = profile
+    previous = profiles[index] if index is not None else None
+    profile = Profile(
+        name=name,
+        base_url=normalize_base_url(base_url),
+        key=key,
+        model=model,
+        context_window=_updated_override(context_window, previous.context_window if previous else None),
+        auto_compact=_updated_override(auto_compact, previous.auto_compact if previous else None),
+        max_output_tokens=_updated_override(
+            max_output_tokens, previous.max_output_tokens if previous else None,
+        ),
+    )
+    if index is not None:
+        profiles[index] = profile
     else:
         profiles.append(profile)
     save_profiles(profiles, root)
@@ -212,6 +270,8 @@ def fetch_balance(profile: Profile, timeout: float = 15) -> Balance:
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise RelayError("key invalid, expired, disabled or out of quota (HTTP 401)") from e
+        if e.code == 404:
+            raise BalanceEndpointNotFound("HTTP 404") from e
         raise RelayError(f"HTTP {e.code}") from e
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise RelayError(f"network error: {getattr(e, 'reason', e)}") from e
@@ -286,6 +346,14 @@ def settings_env(profile: Profile) -> dict[str, str]:
     }
     if profile.model:
         env["ANTHROPIC_MODEL"] = profile.model
+    if profile.context_window is not None:
+        env[CONTEXT_WINDOW_ENV] = str(profile.context_window)
+    if profile.auto_compact == "off":
+        env[DISABLE_AUTO_COMPACT_ENV] = "1"
+    elif profile.auto_compact is not None:
+        env[AUTO_COMPACT_WINDOW_ENV] = str(profile.auto_compact)
+    if profile.max_output_tokens is not None:
+        env[MAX_OUTPUT_TOKENS_ENV] = str(profile.max_output_tokens)
     return env
 
 
@@ -335,6 +403,24 @@ def _write_json_preserving_mode(path: Path, data: dict) -> None:
         raise
 
 
+def _saved_context_overrides(env: dict) -> dict[str, dict]:
+    try:
+        saved = json.loads(env.get(CONTEXT_STATE_ENV, "{}"))
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    overrides = {}
+    for key in CONTEXT_ENV_KEYS:
+        entry = saved.get(key)
+        if not isinstance(entry, dict):
+            continue
+        applied = entry.get("applied")
+        if isinstance(applied, str) and applied == env.get(key):
+            overrides[key] = entry
+    return overrides
+
+
 def apply_to_claude_settings(profile: Profile | None, path: Path | None = None) -> Path:
     """Merge ``profile``'s env into Claude's settings.json; ``None`` removes it."""
     path = path or claude_settings_path()
@@ -344,10 +430,26 @@ def apply_to_claude_settings(profile: Profile | None, path: Path | None = None) 
         env = {}
     if not isinstance(env, dict):
         raise RelayError(f"'env' in {path} is not an object")
+    for key, entry in _saved_context_overrides(env).items():
+        if "previous" in entry:
+            env[key] = entry["previous"]
+        else:
+            env.pop(key, None)
+    env.pop(CONTEXT_STATE_ENV, None)
     for k in ENV_KEYS:
         env.pop(k, None)
     if profile is not None:
-        env.update(settings_env(profile))
+        relay_env = settings_env(profile)
+        overrides = {}
+        for key in CONTEXT_ENV_KEYS:
+            if key in relay_env:
+                entry = {"applied": relay_env[key]}
+                if key in env:
+                    entry["previous"] = env[key]
+                overrides[key] = entry
+        if overrides:
+            relay_env[CONTEXT_STATE_ENV] = json.dumps(overrides, separators=(",", ":"))
+        env.update(relay_env)
     if env:
         data["env"] = env
     else:
@@ -357,21 +459,35 @@ def apply_to_claude_settings(profile: Profile | None, path: Path | None = None) 
 
 
 def active_profile_name(profiles: list[Profile], path: Path | None = None) -> str | None:
-    """The profile whose key is in Claude's settings.json, if any."""
+    """Match the URL and model when profiles share a key."""
     try:
         env = _read_json_object(path or claude_settings_path()).get("env") or {}
     except RelayError:
         return None
-    token = env.get("ANTHROPIC_AUTH_TOKEN") if isinstance(env, dict) else None
-    for p in profiles:
-        if p.key == token:
-            return p.name
-    return None
+    if not isinstance(env, dict):
+        return None
+    matches = [p for p in profiles if p.key == env.get("ANTHROPIC_AUTH_TOKEN")]
+    active_url = env.get("ANTHROPIC_BASE_URL")
+    active_model = env.get("ANTHROPIC_MODEL")
+    for profile in matches:
+        if profile.base_url == active_url and profile.model == active_model:
+            return profile.name
+    return matches[0].name if matches else None
 
 
 def write_profile_settings(profile: Profile, root: Path | None = None) -> Path:
     path = relay_dir(root) / "settings" / f"{profile.name}.json"
-    atomic_write_json(path, {"env": settings_env(profile)})
+    env = settings_env(profile)
+    try:
+        user_env = _read_json_object(claude_settings_path()).get("env")
+    except RelayError:
+        user_env = None  # Claude Code handles errors in its own user settings.
+    if isinstance(user_env, dict):
+        for key, entry in _saved_context_overrides(user_env).items():
+            # A --settings file overlays the user env. Use the value that was
+            # present before `use`, or shadow the old override with an unset value.
+            env.setdefault(key, entry.get("previous", os.environ.get(key, "")))
+    atomic_write_json(path, {"env": env})
     return path
 
 
@@ -419,6 +535,23 @@ def _balance_json(b: Balance | RelayError) -> dict:
     }
 
 
+def _balance_text(balance: Balance | RelayError) -> Text:
+    if isinstance(balance, BalanceEndpointNotFound):
+        return Text.from_ansi(muted("No balance API"))
+    if isinstance(balance, RelayError):
+        return Text.from_ansi(muted(f"error: {balance}"))
+    if balance.unlimited:
+        quota = "unlimited"
+    else:
+        percent = (balance.used_usd / balance.granted_usd * 100) if balance.granted_usd else 0.0
+        quota = (
+            f"{_fmt_usd(balance.available_usd)} left of {_fmt_usd(balance.granted_usd):>10}"
+            f"  ({percent:4.1f}% used)"
+        )
+    expiry = "EXPIRED" if balance.expired else f"expires {_fmt_expiry(balance.expires_at)}"
+    return Text.from_ansi(f"{quota}  {dimmed(expiry)}")
+
+
 def _cmd_list(args) -> None:
     profiles = load_profiles()
     if not profiles:
@@ -437,38 +570,60 @@ def _cmd_list(args) -> None:
                     "key": mask_key(p.key),
                     "model": p.model,
                     "balance": _balance_json(b),
+                    **p.context_options(),
                 }
                 for p, b in zip(profiles, balances)
             ],
         }, indent=2))
         return
 
-    width = max(len(p.name) for p in profiles)
-    total = 0.0
-    for p, b in zip(profiles, balances):
-        marker = accent("*") if p.name == active else " "
-        head = f"{marker} {bolded(p.name.ljust(width))}  {dimmed(mask_key(p.key))}"
-        if isinstance(b, RelayError):
-            print(f"{head}  {muted('error: ' + str(b))}")
-            continue
-        if b.unlimited:
-            quota = "unlimited"
-        else:
-            total += b.available_usd
-            pct = (b.used_usd / b.granted_usd * 100) if b.granted_usd else 0.0
-            quota = (
-                f"{_fmt_usd(b.available_usd):>10} left of {_fmt_usd(b.granted_usd):>10}"
-                f"  ({pct:4.1f}% used)"
-            )
-        expiry = "EXPIRED" if b.expired else f"expires {_fmt_expiry(b.expires_at)}"
-        print(f"{head}  {quota}  {dimmed(expiry)}")
-    print(dimmed(f"\n  total available: {_fmt_usd(total)}"
-                 + ("   (* = active in ~/.claude/settings.json)" if active else "")))
+    table = Table(
+        box=None, padding=(0, 1), pad_edge=False, collapse_padding=True, header_style="bold",
+    )
+    table.add_column("")
+    table.add_column("PROFILE", style="bold", no_wrap=True)
+    table.add_column("KEY", style="dim", no_wrap=True)
+    table.add_column("MODEL", no_wrap=True)
+    table.add_column("GATEWAY", style="dim", overflow="fold")
+    table.add_column("BALANCE", overflow="fold")
+    available_by_key = {}
+    for profile, balance in zip(profiles, balances):
+        marker = Text.from_ansi(accent("*")) if profile.name == active else Text()
+        try:
+            url = urlsplit(profile.base_url)
+            gateway = url.netloc.rsplit("@", 1)[-1] + url.path
+        except ValueError:
+            gateway = "invalid URL"
+        table.add_row(
+            marker, Text(profile.name), Text(mask_key(profile.key)), Text(profile.model or "—"),
+            Text(gateway), _balance_text(balance),
+        )
+        if isinstance(balance, Balance) and not balance.unlimited and not balance.expired:
+            available_by_key[profile.base_url, profile.key] = balance.available_usd
+
+    Console(force_terminal=colors_enabled()).print(table)
+    footer = []
+    if available_by_key:
+        footer.append(f"Known available: {_fmt_usd(sum(available_by_key.values()))}")
+    if active:
+        footer.append("* = active in ~/.claude/settings.json")
+    if footer:
+        print(dimmed("\n  " + "   ".join(footer)))
 
 
 def _cmd_add(args) -> None:
     key = sys.stdin.read().strip() if args.key == "-" else args.key
-    p = add_profile(None, args.name, key, args.base_url, args.model, force=args.force)
+    p = add_profile(
+        None,
+        args.name,
+        key,
+        args.base_url,
+        args.model,
+        force=args.force,
+        context_window=args.context_window,
+        auto_compact=args.auto_compact,
+        max_output_tokens=args.max_output_tokens,
+    )
     print(f"Added relay profile {bolded(p.name)} ({mask_key(p.key)} @ {p.base_url}"
           + (f", model {p.model}" if p.model else "") + ")")
 
@@ -513,6 +668,26 @@ def _cmd_path(args) -> None:
     print(profiles_path())
 
 
+def _token_limit(value: str) -> int | Literal["auto"]:
+    if value == "auto":
+        return "auto"
+    match = re.fullmatch(r"([0-9]+)([km]?)", value.lower())
+    if match:
+        count = int(match[1]) * {"": 1, "k": 1_000, "m": 1_000_000}[match[2]]
+        if count > 0:
+            return count
+    raise argparse.ArgumentTypeError("expected a positive token count (e.g. 128000 or 128k) or auto")
+
+
+def _auto_compact(value: str) -> int | Literal["auto", "off"]:
+    if value == "off":
+        return "off"
+    count = _token_limit(value)
+    if count == "auto" or 100_000 <= count <= 1_000_000:
+        return count
+    raise argparse.ArgumentTypeError("expected 100k to 1M tokens, auto, or off")
+
+
 def main(argv: list[str]) -> None:
     """Handle ``cswap relay <subcommand>`` (pre-dispatched from ``cli.main``)."""
     if "--" in argv:
@@ -546,7 +721,23 @@ Examples:
     p_add.add_argument("key", help="The relay key, or - to read it from stdin")
     p_add.add_argument("--base-url", help="Relay URL (with or without /v1); defaults to the previous profile's")
     p_add.add_argument("--model", help="ANTHROPIC_MODEL to set; defaults to the previous profile's")
+    p_add.add_argument(
+        "--context-window", type=_token_limit, metavar="TOKENS|auto",
+        help="Context window Claude Code assumes for the model",
+    )
+    p_add.add_argument(
+        "--auto-compact", type=_auto_compact, metavar="TOKENS|auto|off",
+        help="Automatic compaction threshold (100k–1M), or off",
+    )
+    p_add.add_argument(
+        "--max-output-tokens", type=_token_limit, metavar="TOKENS|auto",
+        help="Maximum output tokens per request",
+    )
     p_add.add_argument("--force", action="store_true", help="Replace an existing profile")
+    p_add.epilog = (
+        "Context options are optional. Use auto to clear an override. "
+        "With --force, omitted context options retain their existing values."
+    )
 
     p_rm = sub.add_parser("remove", help="Remove a relay profile")
     p_rm.add_argument("name")
